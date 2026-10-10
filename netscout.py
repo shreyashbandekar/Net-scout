@@ -1,12 +1,13 @@
 import argparse
 import ipaddress
 import socket
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 DEFAULT_PORTS = [22, 80, 443, 445, 3389]
+DEFAULT_DISCOVERY_PORTS = [22, 80, 443]
 DEFAULT_TIMEOUT = 0.5
-
 
 def get_local_network():
     hostname = socket.gethostname()
@@ -20,23 +21,33 @@ def get_local_network():
     return local_ip, network
 
 
-def is_host_alive(ip, timeout=DEFAULT_TIMEOUT):
-    try:
-        with socket.create_connection(
-            (str(ip), 80),
-            timeout=timeout,
-        ):
-            return True
-    except (OSError, TimeoutError):
-        return False
+def is_host_alive(
+    ip,
+    ports=DEFAULT_DISCOVERY_PORTS,
+    timeout=DEFAULT_TIMEOUT,
+):
+    for port in ports:
+        try:
+            with socket.create_connection(
+                (str(ip), port),
+                timeout=timeout,
+            ):
+                return True
+        except (OSError, TimeoutError):
+            continue
 
+    return False
 
-def discover_hosts(network, timeout=DEFAULT_TIMEOUT):
+def discover_hosts(
+    network,
+    ports=DEFAULT_DISCOVERY_PORTS,
+    timeout=DEFAULT_TIMEOUT,
+):
     hosts = []
 
     with ThreadPoolExecutor(max_workers=50) as executor:
         futures = {
-            executor.submit(is_host_alive, ip, timeout): ip
+            executor.submit(is_host_alive, ip, ports, timeout): ip
             for ip in network.hosts()
         }
 
@@ -118,35 +129,70 @@ def parse_ports(value):
 
     return sorted(set(ports))
 
+def parse_network(value):
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"Invalid network: {value}"
+        )
+
+    if network.version == 6 and network.num_addresses > 256:
+        raise argparse.ArgumentTypeError(
+            "IPv6 networks larger than /120 are not supported."
+        )
+
+    return network
+def save_json_report(path, data):
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(data, file, indent=4)
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="NetScout - lightweight network reconnaissance tool."
     )
+    discovery_group = parser.add_mutually_exclusive_group()
 
-    parser.add_argument(
+    discovery_group.add_argument(
         "--discover",
         action="store_true",
         help="Discover live hosts on the local /24 network.",
     )
 
-    parser.add_argument(
-        "--target",
-        help="Scan a specific IPv4 address.",
+    discovery_group.add_argument(
+        "--network",
+        type=parse_network,
+        help="Scan a specific IPv4 or IPv6 CIDR network.",
     )
 
+    discovery_group.add_argument(
+        "--target",
+        help="Scan a specific IPv4 or IPv6 address.",
+    )
+
+    parser.add_argument(
+        "--discovery-ports",
+        type=parse_ports,
+        default=DEFAULT_DISCOVERY_PORTS,
+        help="Comma-separated TCP ports used for host discovery.",
+    )
     parser.add_argument(
         "--ports",
         type=parse_ports,
         default=DEFAULT_PORTS,
         help="Comma-separated TCP ports.",
     )
-
     parser.add_argument(
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT,
         help="Connection timeout in seconds.",
+    )
+
+    parser.add_argument(
+        "--json",
+        metavar="FILE",
+        help="Save scan results as a JSON report.",
     )
 
     return parser.parse_args()
@@ -158,15 +204,43 @@ def main():
     if args.timeout <= 0:
         raise SystemExit("Timeout must be greater than zero.")
 
+    if args.network:
+        print(f"\nNetwork: {args.network}")
+        print("\nDiscovering hosts...\n")
+
+        hosts = discover_hosts(
+            args.network,
+            args.discovery_ports,
+            args.timeout,
+        )
+
+        if args.json:
+            save_json_report(
+                args.json,
+                {
+                    "network": str(args.network),
+                    "hosts": hosts,
+                },
+            )
+            print(f"JSON report saved: {args.json}")
+
+        if not hosts:
+            print("No responsive hosts found.")
+            return
+
+        print("HOST")
+        print("----")
+
+        for host in hosts:
+            print(host)
+
+        return
+
     if args.target:
         try:
             target = ipaddress.ip_address(args.target)
         except ValueError:
             raise SystemExit("Invalid IP address.")
-
-        if target.version != 4:
-            raise SystemExit("Only IPv4 targets are supported.")
-
         print(f"\nTarget: {target}\n")
 
         results = scan_host(
@@ -174,6 +248,22 @@ def main():
             args.ports,
             args.timeout,
         )
+
+        if args.json:
+            save_json_report(
+                args.json,
+                {
+                    "target": str(target),
+                    "ports": [
+                        {
+                            "port": port,
+                            "service": service,
+                        }
+                        for port, service in results
+                    ],
+                },
+            )
+            print(f"JSON report saved: {args.json}")
 
         if not results:
             print("No open ports found.")
@@ -194,8 +284,19 @@ def main():
 
         hosts = discover_hosts(
             network,
+            args.discovery_ports,
             args.timeout,
         )
+
+        if args.json:
+            save_json_report(
+                args.json,
+                {
+                    "network": str(network),
+                    "hosts": hosts,
+                },
+            )
+            print(f"JSON report saved: {args.json}")
 
         if not hosts:
             print("No responsive hosts found.")
